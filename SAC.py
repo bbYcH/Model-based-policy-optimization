@@ -1,3 +1,35 @@
+import os
+import sys
+import shutil
+import tempfile
+import subprocess
+# 避免 HPC-X UCC 与 PyTorch 冲突：用 patchelf 让 libucc 显式依赖 libucs，再设置库路径并重新执行
+def _fix_hpcx_ucc_and_reexec():
+    ucc_path = '/opt/hpcx/ucc/lib/libucc.so.1'
+    ucx_lib = '/opt/hpcx/ucx/lib'
+    if not os.path.exists(ucc_path) or not os.path.exists(ucx_lib):
+        return
+    try:
+        import torch  # noqa: F401
+        return  # 已能正常 import，无需修复
+    except ImportError as e:
+        if 'ucs_config_doc_nop' not in str(e) and 'libucc' not in str(e):
+            raise
+    td = tempfile.mkdtemp(prefix='mbpo_ucc_')
+    patched_ucc = os.path.join(td, 'libucc.so.1')
+    shutil.copy2(ucc_path, patched_ucc)
+    try:
+        subprocess.run(
+            ['patchelf', '--add-needed', 'libucs.so.0', patched_ucc],
+            check=True, capture_output=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        shutil.rmtree(td, ignore_errors=True)
+        return
+    env = os.environ.copy()
+    env['LD_LIBRARY_PATH'] = td + ':' + ucx_lib + ':' + env.get('LD_LIBRARY_PATH', '')
+    os.execve(sys.executable, [sys.executable] + sys.argv, env)
+_fix_hpcx_ucc_and_reexec()
 import random
 import gymnasium as gym
 import numpy as np
@@ -235,7 +267,7 @@ if __name__ == "__main__":
     seed = 42
     set_seed(seed)
 
-    env_name = 'Walker2d-v4'  # 选择环境：倒立摆（Pendulum）Pendulum-v1\HalfCheetah-v5\Hopper-v4\Walker2d-v4
+    env_name = 'Hopper-v5'  # 选择环境：倒立摆（Pendulum）Pendulum-v1\HalfCheetah-v5\\Hopper-v5\Walker2d-v4
     env = gym.make(env_name)
     env.reset(seed=seed)
     env.action_space.seed(seed)
@@ -243,10 +275,10 @@ if __name__ == "__main__":
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    num_episodes = 100
-    buffer_size = 100000
+    num_episodes = 10000
+    buffer_size = int(1e6)
     minimal_size = 1000
-    batch_size = 64
+    batch_size = 256
 
     class Args:
         gamma = 0.98
@@ -270,6 +302,7 @@ if __name__ == "__main__":
         state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         done = False
         episode_return = 0
+        episode_steps = 0
         while not done:
             action = agent.select_action(state)
             step_result = env.step(action)
@@ -284,11 +317,13 @@ if __name__ == "__main__":
             if len(replay_buffer) > minimal_size:
                 b_s, b_a, b_r, b_ns, b_d = replay_buffer.sample(batch_size)
                 b_d = (~b_d.astype(bool)).astype(int)
-                for i in range(20):# 每步SAC策略进行20次梯度更新，这里为了和MBPOv2保持一致
+                for i in range(10):# 每步SAC策略进行10次梯度更新，这里为了和MBPOv2保持一致
                     agent.update_parameters((b_s, b_a, b_r, b_ns, b_d), batch_size, episode)
+            episode_steps += 1
         return_list.append(episode_return)
         writer.add_scalar('reward/episode_return', episode_return, episode + 1)
-        print('episode: %d, return: %d' % (episode + 1, episode_return))
+        writer.add_scalar('episode/steps', episode_steps, episode + 1)
+        print('episode: %d, return: %d, steps: %d' % (episode + 1, episode_return, episode_steps))
 
     writer.close()
 

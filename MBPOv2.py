@@ -1,3 +1,36 @@
+import os
+import sys
+import shutil
+import tempfile
+import subprocess
+# 避免 HPC-X UCC 与 PyTorch 冲突：用 patchelf 让 libucc 显式依赖 libucs，再设置库路径并重新执行
+def _fix_hpcx_ucc_and_reexec():
+    ucc_path = '/opt/hpcx/ucc/lib/libucc.so.1'
+    ucx_lib = '/opt/hpcx/ucx/lib'
+    if not os.path.exists(ucc_path) or not os.path.exists(ucx_lib):
+        return
+    try:
+        import torch  # noqa: F401
+        return  # 已能正常 import，无需修复
+    except ImportError as e:
+        if 'ucs_config_doc_nop' not in str(e) and 'libucc' not in str(e):
+            raise
+    td = tempfile.mkdtemp(prefix='mbpo_ucc_')
+    patched_ucc = os.path.join(td, 'libucc.so.1')
+    shutil.copy2(ucc_path, patched_ucc)
+    try:
+        subprocess.run(
+            ['patchelf', '--add-needed', 'libucs.so.0', patched_ucc],
+            check=True, capture_output=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        shutil.rmtree(td, ignore_errors=True)
+        return
+    env = os.environ.copy()
+    env['LD_LIBRARY_PATH'] = td + ':' + ucx_lib + ':' + env.get('LD_LIBRARY_PATH', '')
+    os.execve(sys.executable, [sys.executable] + sys.argv, env)
+_fix_hpcx_ucc_and_reexec()
+
 import gymnasium as gym  # 导入gymnasium库，用于创建和管理强化学习环境
 import itertools  # 导入itertools库，提供无限计数器等迭代工具
 import torch  # 导入PyTorch深度学习框架
@@ -857,7 +890,7 @@ class PredictEnv:
         返回:
             done: 终止标志数组
         """
-        if env_name == "Hopper-v2":  # Hopper环境的终止条件
+        if env_name == "Hopper-v5":  # Hopper环境的终止条件
             assert len(obs.shape) == len(next_obs.shape) == len(act.shape) == 2  # 确保输入是2维的
             height = next_obs[:, 0]  # 获取高度（第0维）
             angle = next_obs[:, 1]  # 获取角度（第1维）
@@ -869,7 +902,7 @@ class PredictEnv:
             done = ~not_done  # 终止 = 非(未终止)
             done = done[:, None]  # 添加一个维度以匹配其他数据的形状
             return done
-        elif env_name == "Walker2d-v2":  # Walker2d环境的终止条件
+        elif env_name == "Walker2d-v4":  # Walker2d环境的终止条件
             assert len(obs.shape) == len(next_obs.shape) == len(act.shape) == 2  # 确保输入是2维的
             height = next_obs[:, 0]  # 获取高度
             angle = next_obs[:, 1]  # 获取角度
@@ -1114,10 +1147,12 @@ class MBPO:
         使用当前策略进行一个完整回合的探索，收集真实经验
         返回:
             episode_return: 该回合的总奖励
+            episode_steps: 该回合执行的步数
         """
         reset_result = self.env.reset()  # 重置环境
         obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result  # 兼容新旧gym接口获取初始观测
         done, episode_return = False, 0  # 初始化终止标志和累计奖励
+        episode_steps = 0  # 记录当前回合执行步数
         while not done:  # 循环直到回合结束
             action = self.agent.select_action(obs)  # 用当前策略选择动作
             step_result = self.env.step(action)  # 在真实环境中执行动作
@@ -1129,7 +1164,8 @@ class MBPO:
             self.env_pool.push(obs, action, reward, next_obs, done)  # 将经验存入真实缓冲区
             obs = next_obs  # 更新当前观测
             episode_return += reward  # 累计奖励
-        return episode_return  # 返回回合总奖励
+            episode_steps += 1  # 当前回合步数+1
+        return episode_return, episode_steps  # 返回回合总奖励和步数
 
     def _log_sac_metrics(self, sac_info, global_step):
         """将SAC策略的训练指标写入TensorBoard"""
@@ -1203,10 +1239,11 @@ class MBPO:
         global_step = 0
         model_train_count = 0
 
-        explore_return = self.explore()
+        explore_return, explore_steps = self.explore()
         print('episode: 1, return: %d' % explore_return)
         return_list.append(explore_return)
         self.writer.add_scalar('reward/episode_return', explore_return, 1)
+        self.writer.add_scalar('episode/steps', explore_steps, 1)
         self.writer.add_scalar('buffer/env_pool_size', len(self.env_pool), 1)
 
         for i_episode in range(self.num_episode - 1):
@@ -1251,6 +1288,7 @@ class MBPO:
 
             self.writer.add_scalar('reward/episode_return', episode_return, episode_num)
             self.writer.add_scalar('reward/episode_length', step, episode_num)
+            self.writer.add_scalar('episode/steps', step, episode_num)
             self.writer.add_scalar('reward/episode_reward_mean', float(np.mean(episode_rewards)), episode_num)
             self.writer.add_scalar('reward/episode_reward_std', float(np.std(episode_rewards)), episode_num)
             self.writer.add_scalar('reward/episode_reward_min', float(np.min(episode_rewards)), episode_num)
@@ -1287,17 +1325,32 @@ if __name__ == "__main__":
     seed = 42  # 设置随机种子
     set_seed(seed)  # 应用随机种子
 
-    env_name = 'Walker2d-v4'  # 选择环境：倒立摆（Pendulum）Pendulum-v1\HalfCheetah-v5\Hopper-v4\Walker2d-v4
+    env_name = 'Hopper-v5'  # 选择环境：倒立摆（Pendulum）Pendulum-v1\HalfCheetah-v5\\Hopper-v5\Walker2d-v4(后两者环境需要写硬编码判断跌倒检测)
     env = gym.make(env_name)  # 创建gym环境实例
     env.reset(seed=seed)  # 重置环境并设置种子
     env.action_space.seed(seed)  # 设置动作空间的随机种子
 
-    num_episodes = 100  # 总训练回合数
+    num_episodes = 10000  # 总训练回合数
+    # 只有 Pendulum 系列环境默认每个 episode 为 200 步，其余 MuJoCo 连续控制环境一般是 1000 步
+    if 'Pendulum-v1' in env_name:
+        max_episode_steps = 200
+    else:
+        max_episode_steps = 1000
     real_ratio = 0.05  # 真实数据占比5%（95%使用模型生成的虚拟数据）
-    buffer_size = 10000  # 真实经验缓冲区大小
-    rollout_batch_size = 1000  # 每次rollout采样1000个初始状态
-    rollout_length = 1  # 每次rollout只走1步（短horizon rollout）
-    model_pool_size = rollout_batch_size * rollout_length  # 模型缓冲区大小 = rollout批量 × rollout步长
+    buffer_size = int(1e6) # 真实经验缓冲区大小
+    rollout_batch_size = 4000  # 在模型想象阶段Model Rollout，我们要从真实经验池env_pool里随机抽出多少个历史状态作为起点，让动力学模型去推演未来。
+    rollout_length = 1  # 每次rollout推演的步数. 所以推演的样本数量=rollout_batch_size*rollout_length
+    model_train_freq = 50  # 每50步训练一次动力学模型
+    model_retain_episode = 1 # 每个回合结束后，保留多少个回合的模型数据
+    model_pool_size = int(1*rollout_batch_size*rollout_length)  # 模型缓冲区大小
+
+    # 下面这个公式是：在最近model_retain_episode个episode中，每隔model_train_freq环境步就进行一次rollout；
+    # 每次rollout会从真实池中采样rollout_batch_size个起始状态，并向前推演rollout_length步。
+    # 一个episode最多max_episode_steps步，所以总共大约有 (max_episode_steps / model_train_freq) 次rollout。
+    # 因此模型缓冲区需要容纳的虚拟样本量约为：
+    #   model_retain_episode * (max_episode_steps/model_train_freq) * rollout_batch_size * rollout_length
+    # 为了简单写成一行，就合并成下面这个公式来估算需要的buffer大小：(就是每个episode进行rollout几次，每次rollout产生的样本数量有多少，然后保留多少个回合的样本)
+    # model_pool_size = int(model_retain_episode*rollout_length*rollout_batch_size*max_episode_steps/model_train_freq)
 
     state_dim = env.observation_space.shape[0]  # 获取状态空间维度
     action_dim = env.action_space.shape[0]  # 获取动作空间维度
@@ -1310,7 +1363,7 @@ if __name__ == "__main__":
         target_update_interval = 1  # 目标网络更新间隔（每步都更新）
         automatic_entropy_tuning = True  # 启用自动熵调整
         hidden_size = 128  # 策略和Q网络的隐藏层大小
-        lr = 5e-4  # 学习率
+        lr = 3e-4  # 学习率
     args = Args()  # 创建超参数实例
 
     num_networks = 7  # 集成模型总数
@@ -1327,9 +1380,9 @@ if __name__ == "__main__":
 
     mbpo = MBPO(env, agent, predict_env, env_pool, model_pool,  # 创建MBPO训练器
                 rollout_length, rollout_batch_size, real_ratio, num_episodes,
-                model_train_freq=50, num_train_repeat=10,  # 每50步训练一次动力学模型，每步SAC策略进行10次梯度更新
-                policy_train_batch_size=64, max_path_length=1000,
-                env_name=env_name)  # 策略训练批量64，每回合最多1000步
+                model_train_freq=model_train_freq, num_train_repeat=10,  # 每50步训练一次动力学模型，每步SAC策略进行10次梯度更新
+                policy_train_batch_size=256, max_path_length=max_episode_steps,
+                env_name=env_name)  # 用于策略训练的batch_size批量64(为混合数据)，每回合最多1000步
 
     return_list = mbpo.train()  # 开始MBPO训练，返回每回合的奖励列表
 
